@@ -84,7 +84,7 @@ personal-ai-companion/
 ├── CHANGELOG.md      ← 版本变更记录
 ├── LICENSE           ← MIT
 ├── references/       ← 九份深度文档，按阶段读
-├── templates/        ← 四份填空模板（访谈提纲 / 剖析 / 运行档案 / 人设包）
+├── templates/        ← 五份填空模板（**素材清单**（先发这份）/ 访谈提纲 / 剖析 / 运行档案 / 人设包）
 └── scripts/          ← 可直接跑的最小骨架，先读 scripts/README.md
 ```
 
