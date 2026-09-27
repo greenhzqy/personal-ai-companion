@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI 数字人格与常驻陪伴"
+  short_description: "把一个人的真实自我做成常驻桌面的 AI 伙伴：采集人格、建档案、感知陪伴闭环"
+  default_prompt: "使用 $personal-ai-companion 帮我从采集开始，做一套属于我自己的 AI 数字人格与常驻伙伴。"
