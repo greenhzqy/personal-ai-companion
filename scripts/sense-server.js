@@ -178,3 +178,17 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, "127.0.0.1", () => {
   console.log("[companion] listening on http://127.0.0.1:" + PORT);
 });
+
+// Fail loudly and machine-readably.
+// A server that dies quietly looks identical to one that was never started --
+// and the watchdog then either restart-loops, or (worse) logs "restarted"
+// while the port stays dead. Exit non-zero with a JSON error instead.
+server.on("error", (err) => {
+  const code = (err && err.code) || "UNKNOWN";
+  const hint =
+    code === "EADDRINUSE" ? "port " + PORT + " already in use -- another copy is probably running (check: netstat -ano | findstr :" + PORT + ")" :
+    code === "EACCES"     ? "no permission to bind port " + PORT :
+                            String((err && err.message) || err);
+  console.error(JSON.stringify({ ok: false, error: code, port: PORT, hint: hint, at: Date.now() }));
+  process.exit(1);
+});

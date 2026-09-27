@@ -23,7 +23,8 @@
 四轮验收里有三轮都遇到"文档在验收期间被改过、行号失效"的问题。解决办法是**冻结 + 指纹**。
 
 ```powershell
-$s = "D:\harness\.dsh\skills\personal-ai-companion"
+# 把 $s 换成你自己那份 skill 的目录（Windows 例：$env:USERPROFILE\.dsh\skills\personal-ai-companion）
+$s = "<本 skill 的目录>"
 Set-Location $s
 $sha = [System.Security.Cryptography.SHA256]::Create()
 
@@ -49,6 +50,52 @@ Write-Host ("文件 " + $tracked.Count + " 个，指纹 " + $fp.Substring(0,32))
 
 > **v1.0–v1.3 的旧指纹**（那几轮验收用的是"递归全部文件"的算法，当时还没有 `.git`）
 > 无法用上面的命令复现，只作历史记录保留在验收报告里。
+
+---
+
+## v1.5 · 2026-09-27 · 对照 Anthropic Agent Skills 规范优化
+
+**来源**：[Metadata Schema](https://mintlify.wiki/anthropics/skills/spec/metadata-schema)、
+[SKILL.md Format](https://mintlify.wiki/anthropics/skills/spec/skill-format)、
+[Progressive Disclosure](https://mintlify.wiki/anthropics/skills/spec/loading-system)，
+以及社区整理的 [Skill Authoring Guide](https://raw.githubusercontent.com/Paldom/node-skills/refs/heads/main/docs/skill-authoring.md)。
+
+**本来就合规的**（核对通过，未改）：`name` 21 字符 kebab-case 且等于目录名 ✓；
+`description` 单物理行 285 字符（落在社区建议的 150–400 区间、远低于 1024 上限）✓；
+正文约 150 行（官方硬上限 500；官方建议 Level 2 < 5000 tokens，实测约 2.9k）✓；
+渐进式披露三层齐全 ✓；**零依赖** ✓。
+
+**按规范改的**：
+
+1. **`scaffolds/` → `scripts/`**。规范里可运行代码的约定目录名是 `scripts/`
+   （`references/` 放长文档、`assets/` 放产出模板）。用 `git mv` 保留历史，同步全部引用。
+2. **补 `license` 字段**（可选，但本包目标是分享；留空等于"保留所有权利"）。
+   值暂填「待本人选定」——**这是本人的决定，不代填**。
+3. **描述补负面触发**（规范：既要 assertive，也要给排除项）：
+   「不适用于：单纯的聊天机器人/角色扮演提示词、企业客服/工单、无个人化诉求的通用桌面工具」。
+4. **正文补「什么时候不要用」一节**（社区指南称这是"最多人跳过、杠杆最高"的一节）：
+   六条排除项各自指出**该用什么替代**，含跨 skill 路由。
+5. **脚本改为"失败必须响"**（规范：exit non-zero + machine-readable errors）。三个脚本原来失败时静默：
+   - `sense-server.js`：端口占用/权限不足 → stderr 输出 `{"ok":false,"error":"EADDRINUSE",...}` + `exit(1)`；
+   - `_sense.ps1`：P/Invoke 类型没加载、或输出文件写不进去 → 错误 JSON + `exit 1`；
+   - `_watchdog.ps1`：原本已会记 `start FAILED`。
+   > **实测抓到我第一版修复是假的**：只加了 `if (-not $Out)` 分支，而真正的失败
+   > （`-Out` 指向不存在的盘）走的是最后那行**未被 try 包住**的写文件，
+   > `$ErrorActionPreference = "SilentlyContinue"` 把它吞掉 → 脚本 **exit 0**、文件没产出。
+   > **失败与成功对调用方不可区分** —— 正是我在修的毛病本身。
+   > 补齐后复测：正常 exit 0 / 失败 exit 1 / 端口占用 exit 1 且输出 JSON。
+
+**刻意保留的两处偏离（附理由，不是漏改）**：
+
+| 偏离 | 规范怎么说 | 为什么保留 |
+|---|---|---|
+| 用 `templates/` 而非 `assets/` | 规范的 `assets/` 包含 "templates" | **本工作区其他 skill（`bzd-*`、`resume-skill`）统一用 `templates/`**，跨 skill 一致性优先于对齐上游命名 |
+| `references/` 之间有互相引用 | "Link references one level deep only"（引用的引用常被半读） | 那些交叉引用是**指路**（"见发布那一节"），不是必读链；SKILL.md 对每份 reference 都是**直接一层**。已确认不存在"先读 A 才能读 B"的依赖 |
+
+**一处规模问题需要说明**：社区指南把"覆盖整个领域的大 skill"列为反模式，建议拆成 2–3 个。
+本 skill 覆盖 8 个阶段，**但该反模式的机理是上下文占用，而它的常驻开销只有 285 字符的描述**
+（正文按需加载、references 按引用加载）。**判断：保持单一入口 + 路由表，不拆。**
+若将来 SKILL.md 膨胀到几百行、或描述塞不下触发词，再按「人格（1–2）/ 运行时（3–5）/ 发布（6–8）」拆。
 
 ---
 
@@ -166,7 +213,7 @@ Write-Host ("文件 " + $tracked.Count + " 个，指纹 " + $fp.Substring(0,32))
 **并新增可运行骨架**（第一轮验收员明确指出：它卡住的本质是"缺可运行起点"，不是"文档不够详细"）：
 
 ```
-scaffolds/  _sense.ps1  sense-server.js  _keywatch.ps1  wallpaper.html
+scripts/  _sense.ps1  sense-server.js  _keywatch.ps1  wallpaper.html
             _watchdog.ps1  _watchdog.vbs  autostart.bat  _probe.html  README.md
 ```
 

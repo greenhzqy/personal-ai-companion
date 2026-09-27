@@ -24,6 +24,21 @@ param(
 
 $ErrorActionPreference = "SilentlyContinue"
 
+# --- failure must be loud and machine-readable ---------------------------
+# A sampler that fails silently is worse than one that is absent: the caller
+# cannot tell "the user is away" from "the script broke". So every exit path
+# writes a JSON object, and a failure exits non-zero.
+function Write-Fail([string]$msg) {
+  $o = [ordered]@{ ok = $false; error = $msg; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+  try {
+    [System.IO.File]::WriteAllText($Out, ($o | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+  } catch { }
+  Write-Error ("[sense] " + $msg)
+  exit 1
+}
+
+if (-not $Out) { Write-Fail "missing-Out" }
+
 Add-Type -TypeDefinition @"
 using System;
 using System.Text;
@@ -46,6 +61,11 @@ public class GreenSense {
     }
 }
 "@
+
+# If the P/Invoke type did not load, every reading below would silently be
+# zero/garbage -- and the caller would see a "successful" sample. That is the
+# "failure and denial return the same value" trap. Check the type exists.
+if (-not ("GreenSense" -as [type])) { Write-Fail "add-type-failed" }
 
 # --- idle seconds ---
 # TickCount is a 32-bit wrapping counter; do the subtraction modulo 2^32
@@ -101,4 +121,13 @@ $obj = [ordered]@{
 
 # charset matters: callers that read this as Latin-1 will mangle CJK titles
 $json = $obj | ConvertTo-Json -Compress
-[System.IO.File]::WriteAllText($Out, $json, (New-Object System.Text.UTF8Encoding($false)))
+
+# The write itself must be guarded, or a bad -Out path ends the script with
+# exit code 0 and no file -- indistinguishable, to the caller, from "the user
+# is away". (Measured: that is exactly what happened before this guard.)
+try {
+  [System.IO.File]::WriteAllText($Out, $json, (New-Object System.Text.UTF8Encoding($false)))
+} catch {
+  Write-Fail ("cannot-write-out: " + $_.Exception.Message)
+}
+exit 0
