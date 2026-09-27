@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>自检页 · 本地服务通不通</title>
+<style>
+  body{margin:0;padding:28px;background:#0b1712;color:#cfe9d8;
+       font:14px/1.7 system-ui,"Segoe UI","Microsoft YaHei",sans-serif}
+  h1{font-size:16px;margin:0 0 6px}
+  p.sub{color:#6f8a7b;margin:0 0 18px}
+  .row{display:flex;gap:10px;align-items:baseline;margin:6px 0;
+       border-left:3px solid #1d3a29;padding-left:12px}
+  .k{width:90px;color:#6f8a7b;flex:none}
+  .ok{color:#7ee787}.bad{color:#ff7b72}
+  pre{background:#0f2318;border:1px solid #1d3a29;border-radius:8px;
+      padding:14px;overflow:auto;font-size:12px;max-height:46vh}
+  button{background:#12261b;color:#cfe9d8;border:1px solid #1d3a29;
+         border-radius:6px;padding:6px 14px;cursor:pointer}
+</style>
+</head>
+<body>
+<h1>本地服务自检</h1>
+<p class="sub">
+  壁纸一直显示「–」或「连不上本地服务」时，先打开这一页，看是哪一环断了。<br>
+  这一页<strong>不会挂长轮询</strong>（它用一个不可能匹配的游标），所以能干净地跑完——
+  这也是为什么它比直接在壁纸页上排查更好用。
+</p>
+
+<div class="row"><span class="k">/sense</span><span id="s1">检测中…</span></div>
+<div class="row"><span class="k">/keys</span><span id="s2">检测中…</span></div>
+<div class="row"><span class="k">结论</span><span id="s3">…</span></div>
+
+<p><button onclick="run()">重新检测</button></p>
+<pre id="raw">—</pre>
+
+<script>
+"use strict";
+const g = (id) => document.getElementById(id);
+
+async function run() {
+  g("s1").textContent = g("s2").textContent = "检测中…";
+  g("s1").className = g("s2").className = "";
+  const out = { origin: location.origin, ua: navigator.userAgent };
+
+  // 1) the sensing endpoint
+  try {
+    const r = await fetch("/sense?t=" + Date.now(), { cache: "no-store" });
+    const j = await r.json();
+    out.sense = j;
+    if (j && j.ok) {
+      g("s1").textContent = "正常 · 空闲 " + Math.round(j.idleSec) + " 秒 · " +
+        (j.proc || "?") + "（" + (j.activity || "?") + "）";
+      g("s1").className = "ok";
+    } else {
+      g("s1").textContent = "服务在，但感知层失败：" + (j && j.error ? j.error : "unknown");
+      g("s1").className = "bad";
+    }
+  } catch (e) {
+    out.senseErr = String(e);
+    g("s1").textContent = "连不上 —— 先确认 node sense-server.js 在跑";
+    g("s1").className = "bad";
+  }
+
+  // 2) the key endpoint. A cursor that cannot match makes the server answer
+  //    immediately instead of holding the request open for 25 seconds.
+  try {
+    const r = await fetch("/keys?since=999999", { cache: "no-store" });
+    const j = await r.json();
+    out.keys = j;
+    g("s2").textContent = "正常 · 已收到 " + (j.n || 0) + " 个键码";
+    g("s2").className = "ok";
+  } catch (e) {
+    out.keysErr = String(e);
+    g("s2").textContent = "失败";
+    g("s2").className = "bad";
+  }
+
+  const ok = out.sense && out.sense.ok && out.keys;
+  g("s3").textContent = ok
+    ? "两环都通 —— 若壁纸仍显示「–」，问题在壁纸页本身（打开浏览器控制台看报错）"
+    : "有环节没通 —— 按上面红色的那一行排查";
+  g("s3").className = ok ? "ok" : "bad";
+  g("raw").textContent = JSON.stringify(out, null, 2);
+}
+
+run();
+</script>
+</body>
+</html>

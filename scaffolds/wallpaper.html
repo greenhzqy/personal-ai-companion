@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>我的桌面伙伴（最小版）</title>
+<style>
+  /* No emoji anywhere. Everything visual is drawn, not borrowed. */
+  :root{
+    --bg:#0b1712; --ink:#cfe9d8; --dim:#6f8a7b; --accent:#5bba75;
+    --dur-1:.18s; --dur-2:.4s;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:
+      radial-gradient(120% 80% at 70% 10%, #14301f 0%, transparent 60%),
+      var(--bg);
+    color:var(--ink);
+    font:14px/1.7 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;
+    overflow:hidden;
+  }
+
+  /* the pet: a breathing core. Transform-only animation: no layout work. */
+  #pet{
+    position:fixed; left:50%; top:46%; width:180px; height:180px;
+    transform:translate(-50%,-50%);
+    will-change:transform;
+  }
+  #pet .core{
+    position:absolute; inset:26px; border-radius:50%;
+    background:radial-gradient(circle at 35% 30%, #9ff0b8 0%, var(--accent) 45%, #1d6a3c 100%);
+    box-shadow:0 0 60px rgba(91,186,117,.35), inset 0 -10px 30px rgba(0,0,0,.35);
+    animation:breathe 4.2s ease-in-out infinite;
+  }
+  #pet .ring{
+    position:absolute; inset:0; border-radius:50%;
+    border:1px solid rgba(91,186,117,.28);
+    animation:spin 18s linear infinite;
+  }
+  #pet .ring i{
+    position:absolute; top:-3px; left:50%; width:6px; height:6px; margin-left:-3px;
+    border-radius:50%; background:var(--accent);
+  }
+  @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* away / idle: dim + freeze. A static frame costs the compositor nothing. */
+  body[data-level="idle"] #pet .core{animation-duration:7s; opacity:.85}
+  body[data-level="away"]{--ink:#9ab3a5}
+  body[data-level="away"] #dim{opacity:.55}
+  body[data-level="away"] #pet .core,
+  body[data-level="away"] #pet .ring,
+  body[data-level="away"] #keys i{animation-play-state:paused}
+
+  #dim{
+    position:fixed; inset:0; background:#000; opacity:0;
+    transition:opacity var(--dur-2) linear; pointer-events:none;
+  }
+
+  /* what it can see about you -- facts only, no keystrokes */
+  #hud{
+    position:fixed; left:28px; bottom:26px; display:flex; gap:22px;
+    font-variant-numeric:tabular-nums; color:var(--dim);
+  }
+  #hud b{color:var(--ink); font-weight:600}
+
+  /* the keyboard strip: proves the push channel works end to end */
+  #keys{
+    position:fixed; left:50%; bottom:78px; transform:translateX(-50%);
+    display:flex; gap:6px;
+  }
+  #keys i{
+    width:30px; height:30px; border-radius:6px;
+    background:#12261b; border:1px solid #1d3a29;
+    transition:transform var(--dur-1) ease-out, background var(--dur-1) ease-out;
+  }
+  #keys i.on{background:var(--accent); transform:translateY(-3px)}
+
+  /* the one line it says. Short, specific, never generic cheerleading. */
+  #say{
+    position:fixed; left:50%; bottom:22px; transform:translateX(-50%);
+    max-width:min(760px,86vw); text-align:center;
+    font-size:15px;
+  }
+  #say span{
+    display:inline-block; padding:8px 16px; border-radius:10px;
+    background:rgba(10,24,17,.72); border:1px solid rgba(91,186,117,.22);
+  }
+</style>
+</head>
+<body data-level="active">
+
+  <div id="pet" aria-hidden="true"><div class="ring"><i></i></div><div class="core"></div></div>
+  <div id="dim"></div>
+
+  <div id="hud">
+    <div>键鼠空闲 <b id="idle">–</b> 秒</div>
+    <div>你在 <b id="act">–</b></div>
+    <div>前台 <b id="proc">–</b></div>
+  </div>
+
+  <div id="keys" aria-hidden="true"></div>
+
+  <div id="say"><span id="saytext">正在连本地服务…</span></div>
+
+<script>
+"use strict";
+/* ------------------------------------------------------------------
+   Minimal companion wallpaper.
+   It does three things, and nothing else:
+     1. asks the local server whether you are at the computer
+     2. dims and freezes itself when you are away
+     3. lights up a key cap when you actually type (long-poll push)
+   ------------------------------------------------------------------ */
+
+const API = location.origin;                 // served by sense-server.js
+const AWAY_AFTER = 300;                      // seconds without input = away
+const IDLE_AFTER = 15;
+
+const $ = (id) => document.getElementById(id);
+
+/* ---- the keyboard strip (visual only, never shows characters) ---- */
+const KEYS = 14;
+for (let i = 0; i < KEYS; i++) $("keys").appendChild(document.createElement("i"));
+const caps = [...$("keys").children];
+
+function flash(slot) {
+  const el = caps[slot % KEYS];
+  el.classList.add("on");
+  setTimeout(() => el.classList.remove("on"), 130);
+}
+
+/* ---- state -> presentation ---- */
+let lastIdle = 0;
+const LINES = {
+  active:  ["我在。", "专注着呢。", "这一屏你盯了挺久了。"],
+  idle:    ["要不要起来走两步？", "喝口水吧。"],
+  away:    ["（你不在，我不出声）"],
+  back:    ["你回来啦。"],
+};
+
+let saidBack = false;
+function say(text) { $("saytext").textContent = text; }
+
+function levelFor(idleSec) {
+  if (idleSec >= AWAY_AFTER) return "away";
+  if (idleSec >= IDLE_AFTER) return "idle";
+  return "active";
+}
+
+function render(s) {
+  const lvl = levelFor(s.idleSec);
+  const body = document.body;
+  if (body.dataset.level !== lvl) {
+    const wasAway = body.dataset.level === "away";
+    body.dataset.level = lvl;
+    if (wasAway && lvl !== "away") { say(LINES.back[0]); saidBack = true; }
+    else say(LINES[lvl][Math.floor(Math.random() * LINES[lvl].length)]);
+  }
+  $("idle").textContent = Math.round(s.idleSec);
+  $("act").textContent = s.activity || "other";
+  $("proc").textContent = s.proc || "–";
+}
+
+/* ---- 1) poll "are you there" ---- */
+let polling = false;
+async function pollSense() {
+  if (polling) return;
+  polling = true;
+  try {
+    const r = await fetch(API + "/sense?t=" + Date.now(), { cache: "no-store" });
+    const s = await r.json();
+    if (s && s.ok) render(s);
+    else say("本地服务返回了错误：" + (s && s.error ? s.error : "unknown"));
+  } catch (e) {
+    say("连不上本地服务（先运行 node sense-server.js）");
+  } finally {
+    polling = false;
+  }
+}
+pollSense();
+setInterval(pollSense, 5000);
+
+/* ---- 2) long-poll for key presses: one request, hangs until you type ---- */
+let cursor = 0;
+async function pollKeys() {
+  try {
+    const r = await fetch(API + "/keys?since=" + cursor, { cache: "no-store" });
+    const j = await r.json();
+    if (j && typeof j.n === "number") cursor = j.n;
+    if (j && Array.isArray(j.vks) && j.vks.length) {
+      // vk is a virtual key code -- map it to a slot for display only
+      j.vks.forEach((vk, i) => flash(vk + i));
+    }
+  } catch (e) { /* server down: back off quietly */ }
+  setTimeout(pollKeys, 120);
+}
+pollKeys();
+
+/* ---- 3) when nobody is looking, do nothing at all ---- */
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { pollSense(); saidBack = false; }
+});
+</script>
+</body>
+</html>
