@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 from math import ceil
@@ -298,6 +299,245 @@ def validate_placeholders() -> None:
                 err(f"template placeholder not filled in {path.relative_to(ROOT)}")
 
 
+# ── 8. 内容自洽（2026-09-27 加）────────────────────────────────────────────────
+# ★ 为什么需要这一节：上面前七节里，**只有"链接"和"BOM"能挡住改包时的连带错误**。
+#   2026-09-27 一天之内，清单从 18 类长到 21 类，下列错误**每次都是人肉发现的**：
+#     · 类数写在 5 处（本文件头 + E组 + references/1 两处 + SKILL.md），漏改一处不报错
+#     · 我插新类时编成 21 号却排在 16 号前面 —— 顺序成了 15, 21, 16…
+#       （**这是本项目第三次犯"编号与顺序不符"**，所以这次把它变成机器检查）
+#     · 工作区里同时躺着 18 类 / 20 类的旧副本，各自演化
+#   前四轮验收的规律是「**补文档型能修好、机制型全漏**」——这一节就是那类机制。
+CHECKLIST_REL = Path("templates") / "素材清单.md"
+CLASS_RE = re.compile(r"^###\s+(\d+)\.\s*(.+)$")
+GROUP_RE = re.compile(r"^##\s*([A-Z0-9]+)\s*组\b")
+# 头部声明，例：「把下面 **21 类、分 6 组**」
+DECLARED_RE = re.compile(r"\*\*(\d+)\s*类[、,]\s*分\s*(\d+)\s*组\*\*")
+# 冻结副本：文件名里带版本号的**故意**保留旧类数，不算过期
+FROZEN_COPY_RE = re.compile(r"-v\d+(?:\.\d+)*\.md$")
+# `类` 后面跟这些词，说明这句话在**声明清单规模**（而不是在举例/分组/指代）
+TOTAL_TAIL_WORDS = ("清单", "勾选", "候选", "大类", "类型")
+COPY_SEARCH_PARENTS = (
+    Path(r"D:\harness\projects"),
+    Path(r"D:\harness\goutoujunshi"),
+)
+
+
+def _collect_classes(text: str) -> tuple[list[int], dict[str, list[int]], str]:
+    """按出现顺序取类号，并记录每类归属的组。"""
+    order: list[int] = []
+    per_group: dict[str, list[int]] = {}
+    current = ""
+    for line in text.splitlines():
+        group = GROUP_RE.match(line)
+        if group:
+            current = group.group(1)
+            per_group.setdefault(current, [])
+            continue
+        cls = CLASS_RE.match(line)
+        if cls:
+            num = int(cls.group(1))
+            order.append(num)
+            if current:
+                per_group[current].append(num)
+    declared = DECLARED_RE.search(text)
+    declared_text = declared.group(0) if declared else ""
+    return order, per_group, declared_text
+
+
+def validate_content_consistency(runtime_only: bool) -> None:
+    path = ROOT / CHECKLIST_REL
+    if not path.is_file():
+        err(f"missing checklist: {CHECKLIST_REL.as_posix()}")
+        return
+    text = read(path)
+    order, per_group, declared_text = _collect_classes(text)
+
+    if not order:
+        err(f"{CHECKLIST_REL.as_posix()}: found no '### N.' class headings")
+        return
+
+    # ① 类号严格 1..N、无重无缺（顺序也要对，不只是集合对）
+    expected = list(range(1, len(order) + 1))
+    if order != expected:
+        err(f"{CHECKLIST_REL.as_posix()}: class numbering is not strictly 1..{len(order)} "
+            f"in document order (got {order})")
+
+    # ② 头部声明的类数要与实际相符
+    if declared_text:
+        declared_n = int(DECLARED_RE.search(text).group(1))
+        if declared_n != len(order):
+            err(f"{CHECKLIST_REL.as_posix()}: header declares {declared_n} 类 "
+                f"but there are {len(order)} '### N.' headings")
+    else:
+        err(f"{CHECKLIST_REL.as_posix()}: header must declare '**N 类、分 M 组**' "
+            f"(so the count is machine-checkable)")
+
+    # ③ 各组声明的类数要与实际相符（例：C2 组 4 类）
+    declared_groups = re.findall(r"\*\*([A-Z0-9]+)\s*组\s*(\d+)\s*类\*\*", text)
+    if declared_groups:
+        for gname, gcount in declared_groups:
+            actual = len(per_group.get(gname, []))
+            if actual != int(gcount):
+                err(f"{CHECKLIST_REL.as_posix()}: group {gname} declares {gcount} 类 "
+                    f"but has {actual}")
+
+    # ④ 其它文件里声明的类数必须与权威源一致（防"改了 A 处没同步 B 处"）
+    #
+    # ★ 历史叙述里的旧类数是**合法的**（CHANGELOG 记的就是"从几类长到几类"），
+    #   但**必须显式标记**，否则百年之后没人分得清"这个 15 是当时的现状还是漏改"。
+    #   规则：讲到旧类数的行，行内要出现 `count-history:` 标记，
+    #   或者整行带 `<!-- count-frozen -->`（用于历史表格整块冻结）。
+    n = len(order)
+    others = ("SKILL.md", "references/1-采集与访谈.md", "CHANGELOG.md", "VERIFICATION.md")
+    # ⚠️ **匹配口径的边界要靠事实验定，不能靠感觉**。这一节试了三版：
+    #    ① `\*\*(\d+)\s*类` —— 太窄：SKILL.md 改成"19 类勾选"时**没报错**。
+    #    ② `(\d+)\s*类`    —— 太松：**72 个误报**，"3 类失败""6 类材料"里的
+    #       "类"是**量词**（3 种失败），不是"清单类别"。
+    #    ③ 现在这版 —— 自己按 `类` 切词，逐个回看数字，而不是用正则去猜。
+    #       ⚠️ **正则解决不了这个问题**，试过三种都错：
+    #         · `(\d+)\s*类(?=。|，|$)` 会从 "第 16 类" 里**匹配到 "6 类"**
+    #           （引擎从 6 起步，回看只看到 "1"，前面并没有"第"）
+    #         · Python 不支持**变长**后顾，`(?<!第\s)` 直接抛错
+    #         · 把 `、` 当断言又会误报 "A 组 2 类、B 组 7 类"
+    #       → **手工回看**才能同时判对："第 N 类" 是指代（跳过）、
+    #         "N 类。" 才是断言（检查）、"A 组 N 类、" 是分组计数（跳过）。
+    #    教训：门禁宁可少查也不能误报（skill 自己的话），
+    #    但也**不能宽到放过真错**——两个方向都要拿实例试。
+    def _asserted_counts(line: str) -> list[str]:
+        """取出这一行里"声称清单规模"的数字。"""
+        out: list[str] = []
+        for m in re.finditer("类", line):
+            j = m.start() - 1
+            while j >= 0 and line[j].isspace():
+                j -= 1
+            k = j
+            while k >= 0 and line[k].isdigit():
+                k -= 1
+            if k == j:                      # "类"前面不是数字
+                continue
+            before = line[:k + 1].rstrip()
+            if before.endswith("第"):        # "第 N 类" = 指代某一类，不是规模
+                continue
+            # ⚠️ **不许用 `.lstrip()`**：Python 的 strip 家族把**中文引号 `"` 也当空白**
+            #    （U+201D 在 Unicode 里算空白），于是 `"19 类勾选"` 会被吃成 `勾选"…`，
+            #    哨兵就把引文误判成声明了。实测踩到过，只剥真正的空格/制表符。
+            rest = line[m.end():]
+            t = 0
+            while t < len(rest) and rest[t] in " \t\u3000":
+                t += 1
+            tail = rest[t:]
+            # 断句符 / 规模词开头 / 行尾，才算"断言清单规模"。
+            # ⚠️ 规模词必须列进来，否则 "21 类勾选" 这种**最典型的声明**会被漏掉
+            #    （实测：漏了它 = 第四次故障注入仍然通过，等于哨兵没起作用）。
+            # 而 `、` 是并列分隔，分组计数天然合法，不算断言。
+            if tail and not (tail[0] in "。，" or tail.startswith(TOTAL_TAIL_WORDS)):
+                continue
+            out.append(line[k + 1:j + 1])
+        return out
+
+    ASSERT_RE = re.compile(r"共\s*(\d+)\s*类")
+    TIME_RE = re.compile(r"共\s*(\d+)\s*类")
+
+    # 冻结标记：`<!-- count-frozen -->`，可带说明写成 `<!-- count-frozen: 原因 -->`。
+    # ⚠️ 判据必须是"**整行就是**这个注释"，不能是"**包含**这个子串"——实测两个坑：
+    #   ① 文档里**讲解**这个标记的那一行（用反引号包着它）会把开关**反向翻转**，
+    #      于是后半篇被当成冻结区、哨兵静默失效；
+    #   ② 开标记后面跟说明文字时，字面量匹配不到，整块冻结根本没生效。
+    FROZEN_MARK_RE = re.compile(r"^<!--\s*count-frozen\s*(?::.*?)?-->$")
+
+    def strip_frozen(text: str) -> str:
+        """把 <!-- count-frozen --> … <!-- count-frozen --> 之间的历史块清空。
+
+        历史块按行标记，但内容可能跨行，所以必须先整块清掉再逐行查——
+        否则旧版本那段"当时的类数"会一直误报。
+        ⚠️ **用空行占位、不删行**：删行会让报错里的行号整体偏移，
+        而"行号指向别处"会让下一个读报错的人白跑一趟（本项目犯过）。
+        """
+        out, frozen = [], False
+        for line in text.splitlines():
+            if FROZEN_MARK_RE.match(line.strip()):
+                frozen = not frozen
+                out.append("")
+                continue
+            out.append("" if frozen else line)
+        return "\n".join(out)
+
+    def strip_quoted(text: str) -> str:
+        """删掉**引文**：反引号包裹的代码/报错原文，以及中英文引号里的内容。
+
+        为什么必须删：文档里要**讲解**踩过的坑，就必然要写出那些错的字样
+        （`header declares 20 类`、"第 25 类"…）。那是**引文**，不是声明，
+        机器不该拿它当现状——不删就会**拦下门禁自己的文档**（实测误报 6 条）。
+
+        ⚠️ 两个坑都是实测踩出来的：
+          ① 引号有三种写法（ASCII `"`、中文 `“”`、中文 `「」`），**只处理一种就会漏**。
+             本项目文档里那几处用的正是 **ASCII `"`** —— 我一开始只按中文引号写，
+             结果误报依旧，白绕了好几轮。
+          ② **不许用 `str.lstrip()` / `str.strip()`**：Python 把中文引号 `"` 也当空白
+             （U+201D 属于 Unicode 空白），会把 `"19 类勾选"` 剥成 `勾选"…`，
+             哨兵随即把引文误判成声明。**只剥真正的空格与制表符。**
+        三类引号数量为奇数说明切分不可靠，此时**退回原文本**、宁可多查。
+        """
+        if text.count("`") % 2 or text.count('"') % 2:
+            return text
+        text = re.sub(r"`[^`]*`", "", text)
+        text = re.sub(r"\u201c[^\u201c\u201d]*\u201d", "", text)
+        return re.sub(r'"[^"]*"', "", text)
+
+    for rel in others:
+        p = ROOT / rel
+        if not p.is_file():
+            continue
+        for lineno, line in enumerate(strip_quoted(strip_frozen(read(p))).splitlines(), 1):
+            if "count-history:" in line:
+                continue
+            for found in _asserted_counts(line) + TIME_RE.findall(line):
+                if int(found) != n:
+                    err(f"{rel}:{lineno}: asserts a {found}-class checklist "
+                        f"but the checklist has {n}")
+
+    # ★ 悬空引用要**扫全包**，而且要处理**列表指代**。
+    #   实测两个坑（都真的漏过）：
+    #     ① 只扫 others 名单里的四个文件 → 正文里的引用根本不在管辖范围
+    #     ② `第 12、13、25 类` 这种**列表指代**：正则 `第\s*(\d+)\s*类`
+    #        只认紧邻"第"的那个数字；逐个"类"回看数字又只拿到 `25`
+    #        （`、` 不是数字，往回走一步就停在 `25`，而"第"在 `12` 前面）
+    #   → 正确做法：**先切出"N、N、N…类"这一段**，再逐个数字判范围。
+    MULTI_REF_RE = re.compile(r"第\s*((?:\d+\s*[、,，]\s*)*\d+)\s*类")
+    DIGITS_RE = re.compile(r"\d+")
+    for md in sorted(ROOT.rglob("*.md")):
+        if ".git" in md.parts:
+            continue
+        rel = md.relative_to(ROOT).as_posix()
+        for lineno, line in enumerate(strip_quoted(strip_frozen(read(md))).splitlines(), 1):
+            for run in MULTI_REF_RE.findall(line):
+                for ref in DIGITS_RE.findall(run):
+                    if int(ref) > n:
+                        err(f"{rel}:{lineno}: references 第 {ref} 类 but the checklist "
+                            f"only has {n} classes")
+
+    # ⑤ 工作区里的**非冻结**同名副本必须与权威源逐字节一致
+    if not runtime_only:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        for parent in COPY_SEARCH_PARENTS:
+            if not parent.is_dir():
+                continue
+            for copy in parent.rglob("素材清单*.md"):
+                if FROZEN_COPY_RE.search(copy.name):
+                    continue  # 文件名带版本号 = 故意冻结的旧版本
+                try:
+                    raw = copy.read_bytes()
+                except OSError:
+                    continue
+                # 文件里显式声明"这是冻结副本"的也跳过——
+                # 试验快照本来就该与权威源不同，但它必须**自己说清楚**。
+                if b"FROZEN-CHECKLIST-COPY" in raw:
+                    continue
+                if hashlib.sha256(raw).hexdigest() != digest:
+                    err(f"stale checklist copy (differs from templates/素材清单.md, "
+                        f"and not marked FROZEN-CHECKLIST-COPY): {copy}")
+
+
 def main() -> int:
     unexpected = [a for a in sys.argv[1:] if a != "--runtime"]
     if unexpected:
@@ -314,6 +554,7 @@ def main() -> int:
     validate_runtime_boundaries()
     validate_markdown_links()
     validate_placeholders()
+    validate_content_consistency(runtime_only)
 
     if ERRORS:
         for e in ERRORS:
