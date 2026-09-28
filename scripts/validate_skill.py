@@ -53,6 +53,11 @@ FORBIDDEN_PARTS = {"research", "documentation", ".git", "__pycache__", "_audit_s
 REQUIRED_PROJECT = ("README.md", "LICENSE", "CHANGELOG.md", "VERIFICATION.md")
 REQUIRED_RUNTIME = ("SKILL.md",)
 REQUIRED_REFERENCES = (
+    # ★ v2.1.2 补：`0-快速开始.md` 原来**漏在这张清单里**。
+    #   后果实测过：SKILL.md 的必读路由指向它（REQUIRED_ROUTES 也查它），
+    #   但"清单完整性"不查它 —— **把它删掉，exit code 仍是 0**。
+    #   这正是本文件自己警告过的病：**"文件之间的一致性，机器不查就一定漂"**。
+    "0-快速开始.md",
     "1-采集与访谈.md", "2-人格档案.md", "3-常驻载体与个性化.md",
     "4-感知与陪伴闭环.md", "5-工程化与护屏.md", "6-验证纪律.md",
     "7-发布与脱敏.md", "8-状态面板与游戏化.md", "9-对外表达.md",
@@ -558,6 +563,46 @@ def validate_content_consistency(runtime_only: bool) -> None:
                         f"and not marked FROZEN-CHECKLIST-COPY): {copy}")
 
 
+# ★ 跨文件一致性哨兵：**"采集顺序"这条规则写在四处，必须一起改**。
+#
+# 为什么要这一条（v2.1.2，原因与证据都实测过）：
+#   v2.1 把采集顺序整个翻了过来（"先发清单" → "先访谈，清单最后当检查表"），
+#   并同步了 `SKILL.md` / `references/1-采集与访谈.md` / `templates/素材清单.md` 三处，
+#   **唯独漏了 `README.md`**——它继续写着「素材清单（**先发这份**）」，
+#   跟权威版**直接相反**，而**所有现有哨兵都没拦住**（它们只盯"类数"这类数字，不盯句子）。
+#   故障注入实测：把 README 那句改回旧顺序，验证器**仍 exit 0**。
+#   → 所以这里按 basename 查两件事：① 新顺序句还在；② 那句话周围不许再出现"先发"。
+#   ⚠️ 这两条只管**这一句话**，不假装能覆盖所有口径漂移。
+_COUNT_SENTINEL_MARKER = "order-sentinel"
+
+
+def validate_cross_file_consistency(runtime_only: bool) -> None:
+    """README 与权威版在"采集顺序"上必须说同一件事。"""
+    if runtime_only:
+        # 安装副本里没有 README（它不在 RUNTIME_ROOTS 里），这条只在开发仓库形态下有效。
+        return
+    readme = ROOT / "README.md"
+    if not readme.is_file():
+        err("missing README.md (cannot check the collection-order sentinel)")
+        return
+    lines = read(readme).splitlines()
+    marked = [i for i, line in enumerate(lines) if _COUNT_SENTINEL_MARKER in line]
+    if not marked:
+        err(f"README.md lost its '{_COUNT_SENTINEL_MARKER}' marker — the collection-order "
+            f"sentinel can no longer locate the sentence it guards")
+        return
+    line = lines[marked[0]]
+    # ① 新顺序必须写在那一句里
+    if "先访谈" not in line or "素材清单" not in line:
+        err("README.md's collection order no longer says '先访谈 … 素材清单 最后当检查表' "
+            "(v2.1 翻了顺序，README 必须跟着改)")
+    # ② 那句里不许再出现把清单排在前的说法
+    for stale in ("先发这份", "先发清单", "先发素材清单"):
+        if stale in line:
+            err(f"README.md puts the checklist first again ({stale!r}) — "
+                f"the authoritative order is 先访谈 → 再建模 → 清单最后当检查表")
+
+
 def main() -> int:
     unexpected = [a for a in sys.argv[1:] if a != "--runtime"]
     if unexpected:
@@ -575,6 +620,7 @@ def main() -> int:
     validate_markdown_links()
     validate_placeholders()
     validate_content_consistency(runtime_only)
+    validate_cross_file_consistency(runtime_only)
 
     if ERRORS:
         for e in ERRORS:
