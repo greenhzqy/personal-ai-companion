@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 import sys
 from math import ceil
 from pathlib import Path
@@ -603,6 +604,76 @@ def validate_cross_file_consistency(runtime_only: bool) -> None:
                 f"the authoritative order is 先访谈 → 再建模 → 清单最后当检查表")
 
 
+# ★ 数据卫生：使用者的**私密产物绝不许进仓库**。
+#
+# 为什么这条是本包最该有的一条门（v2.1.3 加，对标 `goutoujunshi` 的同类检查）：
+#   本包整个流程都会在包里生成**关于一个真人的私密材料**（访谈记录、人格档案、素材台账）。
+#   作者自己用时"反正只有我看"；一旦这个包要给别人用、要推 GitHub，
+#   **一次 `git add -A` 就足以把真人材料推上公开仓库**。
+#   `.gitignore` 只能防手滑（`git add -f` 绕过），所以这里**再上一道机器断言**。
+#   参考实现的做法：`git ls-files -- research 恋爱知识库` 必须为空。
+PACKAGE_ARTIFACT_WHITELIST = frozenset({
+    # 这些文件名**看起来像**使用者的私密产物，其实是包自带的参考文件/模板。
+    # 它们必须能进仓库；只有**根目录下的同名文件**才是私密产物。
+    "references/2-人格档案.md",
+    "templates/人格档案模板.md",
+    "templates/自我剖析模板.md",
+    "templates/人设内容包模板.md",
+})
+
+SENSITIVE_TRACKED_PATTERNS = (
+    # ★ 三条规则，按可靠度排序（第一版写成"黑名单 + 全局 grep + 加例外"，两次误报，
+    #   把 `references/2-人格档案.md` 这种正当文件报成违规。
+    #   **门禁误报比漏报更致命——它会被人直接关掉。**）
+
+    # 规则 1（最可靠）：**根目录**下出现这些名字 = 使用者照流程生成的私密产物。
+    #   加 `^[^/]` 是关键：`references/…` 与 `templates/…` 因此天然不匹配，
+    #   不需要靠例外表去"救"。
+    r"^[^/]*(开工三问|素材台账|访谈记录|降级段落|人物画像)",
+    r"^[^/]*人格档案",
+    r"^[^/]*自我剖析",
+    r"^[^/]*人设内容包",
+    r"^probe-[^/]*\.json$",
+    r"^sense-log[^/]*\.jsonl$",
+    r"^[^/]*\.local\.md$",
+
+    # 规则 2：递归安全网——**任何层级**都不许跟踪的编译/缓存产物。
+    #   就算上面那条根目录规则被将来重构削弱，滥用最广的情形仍会被抓住。
+    r"(^|/)__pycache__/", r"\.py[co]$", r"(^|/)node_modules/",
+
+    # 规则 3：运行期垃圾与凭据（全仓禁，这些在任何位置都不该被跟踪）。
+    r"^_audit_scratch/", r"^logs/", r"^tmp/", r"\.pid$", r"\.log$",
+    r"(^|/)\.env", r"(^|/)secrets?\.",
+)
+
+
+def validate_git_hygiene(runtime_only: bool) -> None:
+    """被 git 跟踪的文件里，不许出现使用者的私密产物或运行期垃圾。"""
+    if runtime_only or not (ROOT / ".git").exists():
+        # 安装副本里没有 .git（它不在运行时白名单里）——这条只对开发仓库有意义。
+        return
+    try:
+        # ⚠️ 必须显式 encoding="utf-8"：中文 Windows 上 subprocess 默认按 **GBK** 解码，
+        #   而 git（配了 core.quotePath=false）输出的是 **UTF-8** 的中文路径，
+        #   于是抛 UnicodeDecodeError → 这条例行检查变成"每次都崩"。
+        #   （本包第 N 次踩编码坑：PS 的 GBK 读 UTF-8、Set-Content 加 BOM、现在是这个。）
+        tracked = subprocess.run(
+            ["git", "-c", "core.quotePath=false", "ls-files"],
+            cwd=ROOT, check=False, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        ).stdout.splitlines()
+    except OSError as exc:  # git 不存在之类
+        err(f"cannot run git ls-files to check data hygiene: {exc}")
+        return
+    for rel in tracked:
+        if rel in PACKAGE_ARTIFACT_WHITELIST:
+            continue
+        for pattern in SENSITIVE_TRACKED_PATTERNS:
+            if re.search(pattern, rel):
+                err(f"private artifact or runtime junk is tracked by git "
+                    f"(must stay out of the repo): {rel}  [matches {pattern!r}]")
+
+
 def main() -> int:
     unexpected = [a for a in sys.argv[1:] if a != "--runtime"]
     if unexpected:
@@ -621,6 +692,7 @@ def main() -> int:
     validate_placeholders()
     validate_content_consistency(runtime_only)
     validate_cross_file_consistency(runtime_only)
+    validate_git_hygiene(runtime_only)
 
     if ERRORS:
         for e in ERRORS:
