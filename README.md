@@ -95,6 +95,18 @@ personal-ai-companion/
 
 ---
 
+## 与其它 skill 的接口
+
+> 这一节原先在 `SKILL.md` 里（占常驻上下文）。v2.1.4 搬到此处——**它主要是给人和维护者看的**，
+> 而 `SKILL.md` 是每次触发都加载的文件。**搬走，不是删掉。**
+
+- **`learning-by-building`**：本 skill 定「做什么、为什么」，那个定教学节奏（可叠加）。
+- **`session-handoff`**：跨多天多会话的长线工程，**每个阶段收口写一份交接**，别把会话拖爆。
+- **`univer` 系列**：要把档案/状态数据做成表格或看板时交给它们。
+- **七种失败模式**（常见死法 + 对策）在 `references/0-快速开始.md` 第五节。
+
+---
+
 ## 参考实现
 
 **<https://github.com/greenhzqy/green-pet-wallpaper>** —— 一个真实做出来、并且跑在作者桌面上的成品。

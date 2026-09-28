@@ -5,6 +5,19 @@
 >
 > 这份文件的立场：**可执行的检查 > 文档里的承诺**。
 > 你说"包是完整的"没有意义，`validate_skill.py` 退出码是 0 才有意义。
+>
+> ★★ **权威源（v2.1.4 补，此前本文件没有指向它）**：
+> **Agent Skills 开放规范** → `https://agentskills.io/specification`
+> （含 frontmatter 六字段的定义与约束）；配套的
+> **评测** `…/skill-creation/evaluating-skills`、
+> **触发率优化** `…/skill-creation/optimizing-descriptions`、
+> **最佳实践** `…/skill-creation/best-practices`；
+> 官方参考验证器 `https://github.com/agentskills/agentskills/tree/main/skills-ref`。
+> 宿主侧行为（字段被静默忽略、1536 字符截断、六个可分发字段）见
+> `https://code.claude.com/docs/en/skills.md`。
+>
+> ⚠️ **本文件此前只引用"上游值"而不给出处，导致两处口径写错**（行数 150 被当成上游值、
+> 而上游是 500）。**凡是引用规范的地方，都要带链接**——否则下一个人无法核对。
 
 ---
 

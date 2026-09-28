@@ -43,7 +43,15 @@ SKILL_MAX_APPROX_TOKENS = 4_500
 # frontmatter 允许的键。上游默认只有 name + description；
 # 本包是刻意加 license 的（v1.5 决定：目标是分享，不给许可 = 别人不能合法用）。
 # 这是**本地约定**，不是漏改——见 references/10-skill工程化.md 第八节。
-ALLOWED_FRONTMATTER_KEYS = ("name", "description", "license")
+#
+# ★ v2.1.4 补齐官方规范定义的六个字段（此前只允许 3 个，比规范更严）。
+#   依据：Agent Skills 规范 https://agentskills.io/specification 的 frontmatter 表——
+#   name / description / license / compatibility / metadata / allowed-tools。
+#   `compatibility`（≤500 字符）正是本包该用的：它要求 Windows + PowerShell + Win32 API，
+#   而这条信息此前只写在 README 的散文里，**机器读不到**。
+ALLOWED_FRONTMATTER_KEYS = (
+    "name", "description", "license", "compatibility", "metadata", "allowed-tools",
+)
 
 # 运行时白名单：只有这些会被装进使用者的包
 RUNTIME_ROOTS = ("SKILL.md", "agents", "references", "scripts", "templates")
@@ -180,6 +188,46 @@ def validate_frontmatter() -> None:
     if "\n" in desc:
         err("description must be a single physical line")
 
+    # ── v2.1.4 补的三条（依据：Agent Skills 规范 + 宿主原文，见 references/10）────
+    # ① name 必须与**父目录同名**。
+    #    规范原文："Must match the parent directory name"；宿主行为是"名字缺失时
+    #    **静默改用目录名**"（code.claude.com/docs/en/skills.md：`Defaults to the directory name`）。
+    #    原来只比对硬编码常量 SKILL_NAME —— 把目录改名成 personal-ai-companion-v2，
+    #    **门禁照样 exit 0，而宿主会悄悄用目录名**。这正是本包反复栽的
+    #    "改了 A 没同步 B，而门禁不报"，只是 A 换成了目录名。
+    if name and ROOT.name != name:
+        err(f"SKILL.md name {name!r} must match the parent directory name {ROOT.name!r} "
+            f"(宿主在 name 缺失/不一致时会静默改用目录名)")
+    if name.startswith("-") or name.endswith("-") or "--" in name:
+        err(f"invalid skill name: {name!r} (不得以连字符开头/结尾，也不得含连续连字符)")
+
+    # ② compatibility（规范定义的可选字段，≤500 字符）。
+    #    本包此前把它当"未知键"直接判非法，而它正是为"环境要求"设计的——
+    #    本包有真实的环境约束（Windows + PowerShell + Win32 API），却只写在 README 的散文里。
+    compat_match = re.search(r"^compatibility:\s*(.+)$", frontmatter, re.MULTILINE)
+    if compat_match:
+        compat = compat_match.group(1).strip()
+        if len(compat) > 500:
+            err(f"compatibility too long: {len(compat)} > 500 (规范上限)")
+
+    # ③ metadata.version 与 git tag 对账（**只警告，不 fail**）。
+    #    为什么需要：版本戳此前只写在正文里，靠一条人工纪律维护，
+    #    v2.1.2 那次它已经落后过 6 个版本。挪进 metadata 后可以机器比对。
+    #    为什么只警告：git tag 不是宿主概念，没有 tag 的环境（安装副本/浅克隆）不该因此失败。
+    ver_match = re.search(r"^\s+version:\s*[\"']?([0-9][^\s\"']*)[\"']?\s*$",
+                          frontmatter, re.MULTILINE)
+    if ver_match:
+        declared = ver_match.group(1)
+        try:
+            tag = subprocess.run(["git", "describe", "--tags", "--abbrev=0"],
+                                 cwd=ROOT, check=False, capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace").stdout.strip()
+        except OSError:
+            tag = ""
+        if tag.startswith("v") and tag[1:] != declared:
+            print(f"  ⚠️  metadata.version 是 {declared}，而 git 最新 tag 是 {tag} "
+                  f"—— 打 tag 时记得同步（**警告，不阻断**）")
+
 
 # ── 2. 上下文预算 ────────────────────────────────────────────────────────────
 def validate_budget() -> None:
@@ -247,7 +295,42 @@ def validate_routes_and_regressions() -> None:
                 err(f"{rel} missing required behavior boundary (regression marker): {marker!r}")
 
 # ── 5. 运行边界 ──────────────────────────────────────────────────────────────
+# ★ v2.1.4 修：这里原来"见到 __pycache__ 就报错"，**在磁盘上**判污染。
+#   后果：任何开发者（或测试）`import` 一次本脚本，Python 就自动生成
+#   `scripts/__pycache__/*.pyc`，门禁立刻变红 —— 而那是**完全正常**的本地状态。
+#   判据改对了：**"存在"不是错误，"被 git 跟踪"才是错误**（.gitignore 已忽略前者）。
+#   依据：本包自己在 references/6-验证纪律.md 里的纪律——判据必须能区分
+#   "正常状态"与"失败状态"，否则它会不停地向你报警（人就会开始忽略门禁）。
+_TRACKED_CACHE: set[str] = set()
+
+
+def tracked_paths() -> set[str]:
+    """被 git 跟踪的文件集合（posix 分隔）。非 git 目录返回空集。
+
+    只算一次并缓存——validate_git_hygiene 与 validate_runtime_boundaries 共用。
+    """
+    global _TRACKED_CACHE
+    if _TRACKED_CACHE:
+        return _TRACKED_CACHE
+    if not (ROOT / ".git").exists():
+        return set()
+    try:
+        # `-z`：NUL 分隔，git **从不加引号也不做八进制转义**，所以正确性不依赖
+        # 任何 git 配置（`core.quotePath` 在本仓库里其实没设）。
+        # encoding 必须显式：中文 Windows 上 subprocess 默认按 GBK 解码 UTF-8 路径 → 崩。
+        raw = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=ROOT, check=False, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        ).stdout
+        _TRACKED_CACHE = {p for p in raw.split("\0") if p}
+    except OSError as exc:
+        err(f"cannot run git ls-files: {exc}")
+    return _TRACKED_CACHE
+
+
 def validate_runtime_boundaries() -> None:
+    tracked = tracked_paths()
     for root_name in RUNTIME_ROOTS:
         root = ROOT / root_name
         if not root.exists():
@@ -255,10 +338,25 @@ def validate_runtime_boundaries() -> None:
         paths = [root] if root.is_file() else root.rglob("*")
         for path in paths:
             rel = path.relative_to(ROOT)
-            if FORBIDDEN_PARTS.intersection(rel.parts):
+            rel_posix = rel.as_posix()
+            rel_parts = set(rel.parts)
+            is_compiled = path.suffix in {".pyc", ".pyo"}
+
+            # ★ v2.1.4：编译产物与缓存目录**只有被 git 跟踪才是错的**。
+            #   `__pycache__/` 在磁盘上存在是任何一次 import/测试的正常副产物；
+            #   把它判成"运行时污染"会让每个开发者一跑门禁就看到红灯，
+            #   然后人就开始忽略门禁——那比漏报更糟。
+            #   注意：**目录本身**也要走这条（第一版只给文件加了跳过，目录仍被报，
+            #   所以这里先判 is_compiled 或目录名，再统一按"是否被跟踪"决定）。
+            is_cache_dir = path.is_dir() and path.name == "__pycache__"
+            if is_compiled or is_cache_dir:
+                if rel_posix not in tracked:
+                    continue  # 本地生成的、未被跟踪的 → 正常状态，不报
+                err(f"compiled/cache artifact is tracked by git (must stay out): {rel}")
+                continue
+
+            if FORBIDDEN_PARTS.intersection(rel_parts):
                 err(f"non-runtime content nested inside runtime allowlist: {rel}")
-            if path.is_file() and path.suffix in {".pyc", ".pyo"}:
-                err(f"compiled artifact found in runtime content: {rel}")
 
 
 # ── 6. ★ 本地 markdown 链接必须能解析 ────────────────────────────────────────
@@ -649,22 +747,15 @@ SENSITIVE_TRACKED_PATTERNS = (
 
 def validate_git_hygiene(runtime_only: bool) -> None:
     """被 git 跟踪的文件里，不许出现使用者的私密产物或运行期垃圾。"""
-    if runtime_only or not (ROOT / ".git").exists():
-        # 安装副本里没有 .git（它不在运行时白名单里）——这条只对开发仓库有意义。
+    # ★ v2.1.4：去掉了 `runtime_only` 短路。
+    #   原来写成 `if runtime_only or not (ROOT/".git").exists(): return`，
+    #   于是**安装副本形态下这条检查完全不跑**；而参考实现（goutoujunshi）的同类检查
+    #   在两种形态下都跑。一个陌生人完全可能在自己的 skill 目录里 `git init` 并提交——
+    #   那正是这条门最该生效的场景。现在改成：**只看 .git 在不在**，与形态无关。
+    if not (ROOT / ".git").exists():
+        # 安装副本（或任何非 git 目录）里没有版本控制——这条自然 no-op，不是被跳过。
         return
-    try:
-        # ⚠️ 必须显式 encoding="utf-8"：中文 Windows 上 subprocess 默认按 **GBK** 解码，
-        #   而 git（配了 core.quotePath=false）输出的是 **UTF-8** 的中文路径，
-        #   于是抛 UnicodeDecodeError → 这条例行检查变成"每次都崩"。
-        #   （本包第 N 次踩编码坑：PS 的 GBK 读 UTF-8、Set-Content 加 BOM、现在是这个。）
-        tracked = subprocess.run(
-            ["git", "-c", "core.quotePath=false", "ls-files"],
-            cwd=ROOT, check=False, capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        ).stdout.splitlines()
-    except OSError as exc:  # git 不存在之类
-        err(f"cannot run git ls-files to check data hygiene: {exc}")
-        return
+    tracked = sorted(tracked_paths())
     for rel in tracked:
         if rel in PACKAGE_ARTIFACT_WHITELIST:
             continue
@@ -674,11 +765,137 @@ def validate_git_hygiene(runtime_only: bool) -> None:
                     f"(must stay out of the repo): {rel}  [matches {pattern!r}]")
 
 
+# ★★ 覆盖地图（v2.1.4）：把"哪些语义事实写在多处、谁在守"变成**显式登记**。
+#
+# 为什么加（这条是本包方法论缺的最后一块）：
+#   本包最常犯的错是"改了 A 处没同步 B 处"（被记录过 9 次），每次的应对都是
+#   **再手搓一条针对性哨兵**。于是 exit 0 无法区分两种情况：
+#     ① 包是自洽的；② **这次漂移恰好落在哨兵覆盖范围之外**。
+#   本包已经用三处实例证明这两者返回同一个值：
+#     · `references/0-快速开始.md` 不在必需清单里 → 删掉仍 exit 0（v2.1.2 已修）
+#     · README 的采集顺序句不被任何哨兵管辖 → 改回旧顺序仍 exit 0（v2.1.2 已修）
+#     · `SKILL.md` 的 name 与目录名不一致 → 不查（v2.1.4 已修）
+#   **三条全是事后被人肉发现的。**
+#
+# 对标：oasdiff（https://www.oasdiff.com/）的纪律是"每一个位置要么被某条检查覆盖、
+#   要么带一条写明理由的豁免，**没有一个位置可以是未决的**，出现未归类的新位置即构建失败"。
+#   ⚠️ 诚实的边界：oasdiff 面对的是**形式化 schema**（"1.5 万种编辑"可枚举），
+#   本包面对的是**自然语言散文**——位置可枚举，但"语义是否漂移"不可自动判定。
+#   所以这里借的是"穷举 + 显式豁免 + 未归类即失败"**这个纪律**，
+#   **不是**"自动判定语义等价"这个能力。
+#
+# 每个条目：事实名 → (出现在哪些文件, 守护它的检查名 or None(必须写豁免理由))
+COVERAGE_MAP: dict[str, tuple[tuple[str, ...], str | None]] = {
+    "采集顺序（先访谈→再建模→清单最后当检查表）": (
+        ("SKILL.md", "references/1-采集与访谈.md",
+         "templates/素材清单.md", "README.md"),
+        "validate_cross_file_consistency（order-sentinel，只管 README 那一句）",
+    ),
+    "素材清单的类数（21）": (
+        ("templates/素材清单.md", "SKILL.md"),
+        "validate_content_consistency（断言扫描 + 1..N 严格递增 + 悬空引用）",
+    ),
+    "版本戳": (
+        ("SKILL.md", "CHANGELOG.md"),
+        "validate_frontmatter（metadata.version 对 git tag，**只警告**）",
+    ),
+    "references/ 的清单完整性": (
+        ("scripts/validate_skill.py",),
+        "validate_inventory（REQUIRED_REFERENCES）",
+    ),
+    "SKILL.md 的 name 与目录名": (
+        ("SKILL.md",),
+        "validate_frontmatter（v2.1.4 新增）",
+    ),
+    "私密产物不许进仓库": (
+        (".gitignore", "scripts/validate_skill.py"),
+        "validate_git_hygiene（git ls-files 断言）",
+    ),
+    "references/ 文件名序号与阶段号错位": (
+        ("SKILL.md", "references/0-快速开始.md"),
+        None,  # ← 显式豁免：见下面的豁免理由表
+    ),
+}
+# 显式豁免的理由（`None` 的条目必须在这里有解释，否则门禁失败）。
+COVERAGE_EXEMPTIONS: dict[str, str] = {
+    "references/ 文件名序号与阶段号错位":
+        "已知未覆盖：修它要重命名 11 个文件并同步全包引用，属于结构变更而非修补；"
+        "v2.1.2 审计已记录、留给下一个决定版本。**当前没有哨兵守它**，这是显式接受的欠账。",
+}
+
+
+def validate_coverage_map() -> None:
+    """每个"会漂移的事实"要么被某条检查覆盖，要么带一条写明理由的豁免。"""
+    for fact, (sources, guard) in COVERAGE_MAP.items():
+        # ① 登记的文件必须真的存在（防止地图本身过期）
+        for rel in sources:
+            if not (ROOT / rel).exists():
+                err(f"coverage map lists a file that does not exist: {rel} "
+                    f"(fact: {fact})")
+        # ② 没写守护检查的，必须有显式豁免理由
+        if guard is None and fact not in COVERAGE_EXEMPTIONS:
+            err(f"coverage map has an UNDECIDED fact (no guard, no written exemption): "
+                f"{fact} —— 这正是本包最常犯的病：漂移位置未归类时 exit 0 不携带任何信息")
+    # ③ 反向检查：豁免表里不许留下地图上已经没有的条目
+    for fact in COVERAGE_EXEMPTIONS:
+        if fact not in COVERAGE_MAP:
+            err(f"coverage exemption refers to a fact not in the map: {fact}")
+
+
+CHECKS: tuple[tuple[str, str, str], ...] = (
+    ("validate_frontmatter", "SKILL.md 的元数据", "frontmatter 键/name↔目录名/description/compatibility/metadata.version"),
+    ("validate_budget", "常驻上下文预算", "SKILL.md 行数/字符/近似 token"),
+    ("validate_inventory", "清单完整性", "必需文件（含 references/ 与 templates/ 逐份）"),
+    ("validate_routes_and_regressions", "路由与回归哨兵", "SKILL.md 必须能找到关键参考；9 条行为边界句"),
+    ("validate_runtime_boundaries", "运行边界", "白名单内无 documentation/research/.git；编译产物只有被跟踪才报"),
+    ("validate_markdown_links", "本地链接", "markdown 相对链接全部可解析"),
+    ("validate_placeholders", "占位符", "没有未填的 [TODO"),
+    ("validate_content_consistency", "内容自洽", "类数断言/1..N 严格递增/过期副本/悬空类号引用"),
+    ("validate_cross_file_consistency", "跨文件一致性", "README 的采集顺序句（order-sentinel）"),
+    ("validate_git_hygiene", "数据卫生", "私密产物/运行期垃圾不被 git 跟踪"),
+    ("validate_coverage_map", "覆盖地图", "每条会漂移的事实都有哨兵或写明理由的豁免"),
+)
+
+
+def explain() -> int:
+    """`--explain`：列出这次跑了什么、覆盖了什么、以及**已知没被覆盖的**。
+
+    为什么要有这个模式：本包最缺的从来不是"门禁跑没跑"，而是**门禁的覆盖面**——
+    `exit 0` 无法区分"包是自洽的"与"这次漂移恰好不在覆盖范围内"。
+    这个模式把覆盖面变成可以直接看的东西（对标：Homebrew/Next.js 那类
+    `*=DEBUG=1` 的"只打印不发送"模式——**说明优先于采集**）。
+    """
+    print(f"{SKILL_NAME} · 门禁覆盖面（--explain）\n")
+    print("本次会跑的检查：")
+    for name, what, detail in CHECKS:
+        print(f"  · {name:<34} {what}")
+        print(f"      {detail}")
+    print("\n覆盖地图（会漂移的事实 → 谁在守）：")
+    for fact, (sources, guard) in COVERAGE_MAP.items():
+        who = guard if guard else "⚠️ 无哨兵（见豁免理由）"
+        print(f"  · {fact}")
+        print(f"      出现在: {', '.join(sources)}")
+        print(f"      守护者: {who}")
+    if COVERAGE_EXEMPTIONS:
+        print("\n显式豁免（**已知未覆盖，理由写在这里**）：")
+        for fact, why in COVERAGE_EXEMPTIONS.items():
+            print(f"  · {fact}\n      {why}")
+    print("\n已知不覆盖的（本模式的诚实边界）：")
+    print("  · **语义**是否漂移（只查位置与字面）；自然语言等价不可自动判定。")
+    print("  · 只在本机跑过的行为（真机现象、长时间运行、非 Windows 平台）。")
+    print("  · `description` 的触发率——**本包从未测过**，官方方法是 20 条查询×3 次。")
+    print("\n提示：加检查或改覆盖地图后，请顺手更新本清单与 COVERAGE_MAP。")
+    return 0
+
+
 def main() -> int:
-    unexpected = [a for a in sys.argv[1:] if a != "--runtime"]
+    KNOWN = ("--runtime", "--explain")
+    unexpected = [a for a in sys.argv[1:] if a not in KNOWN]
     if unexpected:
         print(f"ERROR: unsupported arguments: {' '.join(unexpected)}")
         return 2
+    if "--explain" in sys.argv[1:]:
+        return explain()
     runtime_only = "--runtime" in sys.argv[1:]
 
     print(f"validating {SKILL_NAME}"
@@ -693,6 +910,7 @@ def main() -> int:
     validate_content_consistency(runtime_only)
     validate_cross_file_consistency(runtime_only)
     validate_git_hygiene(runtime_only)
+    validate_coverage_map()
 
     if ERRORS:
         for e in ERRORS:
